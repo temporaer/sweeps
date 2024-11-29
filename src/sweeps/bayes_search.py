@@ -1,7 +1,8 @@
 import warnings
 from copy import deepcopy
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Callable
+import logging
 
 import numpy as np
 from scipy import stats as scipy_stats
@@ -19,6 +20,31 @@ warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 GAUSSIAN_PROCESS_NUGGET = 1e-7
 STD_NUMERICAL_STABILITY_EPSILON = 1e-6
+
+
+def _reject_fn_wrapper(
+    reject_fn: Callable[[dict], bool], params: HyperParameterSet
+) -> Callable[[list], bool]:
+    def wrapped_fn(X: list) -> bool:
+        return reject_fn(_unnormalize_params(X, params).to_config())
+
+    return wrapped_fn
+
+
+def _unnormalize_params(
+    suggested_X: ArrayLike, params: HyperParameterSet
+):
+    """
+    convert the parameters from vector of [0,1] values
+    to the original ranges
+    """
+    for param in params:
+        if param.type == HyperParameter.CONSTANT:
+            continue
+        try_value = suggested_X[params.param_names_to_index[param.name]]
+        param.value = param.ppf(try_value)
+
+    return params
 
 
 class ImputeStrategy(str, Enum):
@@ -68,10 +94,11 @@ def sigmoid(x: ArrayLike) -> ArrayLike:
     return np.exp(-np.logaddexp(0, -x))
 
 
-def random_sample(X_bounds: ArrayLike, num_test_samples: integer) -> ArrayLike:
+def random_sample(X_bounds: ArrayLike, num_test_samples: integer, reject_fn: Optional[Callable[[list], None]] = None) -> ArrayLike:
     num_hyperparameters = len(X_bounds)
     test_X = np.empty((int(num_test_samples), num_hyperparameters))
-    for ii in range(num_test_samples):
+    ii = 0
+    while ii < num_test_samples:
         for jj in range(num_hyperparameters):
             if type(X_bounds[jj][0]) == int:
                 assert type(X_bounds[jj][1]) == int
@@ -81,6 +108,9 @@ def random_sample(X_bounds: ArrayLike, num_test_samples: integer) -> ArrayLike:
                     np.random.uniform() * (X_bounds[jj][1] - X_bounds[jj][0])
                     + X_bounds[jj][0]
                 )
+        if reject_fn is not None and reject_fn(test_X[ii]):
+            continue
+        ii += 1
     return test_X
 
 
@@ -178,6 +208,7 @@ def next_sample(
     num_points_to_try: integer = 1000,
     opt_func: str = "expected_improvement",
     test_X: Optional[ArrayLike] = None,
+    reject_fn: Optional[Callable[[list], bool]] = None,
 ) -> Tuple[ArrayLike, floating, floating, floating, floating, str]:
     """Calculates the best next sample to look at via bayesian optimization.
 
@@ -253,7 +284,7 @@ def next_sample(
             row = np.random.choice(test_X.shape[0])
             X = test_X[row, :]
         else:
-            X = random_sample(X_bounds, 1)[0]
+            X = random_sample(X_bounds, 1, reject_fn)[0]
         if filtered_X.shape[0] < 1:
             prediction = 0.0
         else:
@@ -273,7 +304,7 @@ def next_sample(
     )
     # Look for the minimum value of our fitted-target-function + (kappa * fitted-target-std_dev)
     if test_X is None:  # this is the usual case
-        test_X = random_sample(X_bounds, num_points_to_try)
+        test_X = random_sample(X_bounds, num_points_to_try, reject_fn)
     y_pred, y_pred_cov = gp.predict(test_X, return_cov=True)
 
     # HACK: Covariance matrix uses cholenky decomposition, so
@@ -283,25 +314,15 @@ def next_sample(
     # best value of y we've seen so far.  i.e. y*
     min_unnorm_y = np.min(filtered_y)
 
-    """
-    if opt_func == "probability_of_improvement":
-        min_norm_y = (min_unnorm_y - y_mean) / y_stddev - improvement
-    else:
-    """
-    min_norm_y = (min_unnorm_y - y_mean) / y_stddev - improvement
+    min_norm_y = (min_unnorm_y - y_mean) / y_stddev
+    improve = y_pred - min_norm_y - improvement
 
-    Z = -(y_pred - min_norm_y) / (y_pred_std + STD_NUMERICAL_STABILITY_EPSILON)
-    prob_of_improve: np.ndarray = scipy_stats.norm.cdf(Z)
-    e_i = -(y_pred - min_norm_y) * scipy_stats.norm.cdf(
-        Z
-    ) + y_pred_std * scipy_stats.norm.pdf(Z)
-
-    """
-    if opt_func == "probability_of_improvement":
-        best_test_X_index = np.argmax(prob_of_improve)
-    else:
-    """
-
+    scaled = - improve / (y_pred_std + STD_NUMERICAL_STABILITY_EPSILON)
+    prob_of_improve = scipy_stats.norm.cdf(scaled)
+    pdf = scipy_stats.norm.pdf(scaled)
+    exploit = improve * prob_of_improve
+    explore = y_pred_std * pdf
+    e_i = exploit + explore
     best_test_X_index = np.argmax(e_i)
 
     # Make sure Kernel is not too close to boundaries
@@ -314,10 +335,14 @@ def next_sample(
             continue
         for _ in range(hyp.n_elements):
             if list_close[idx, 0] or list_close[idx, 1]:
-                warnings = "\n Some dimmensions of kernel are close to their bounds (bad fit), the next sample will be a random sample within parameter space"
+                warnings = "\n Some dimensions of kernel are close to their bounds (bad fit), the next sample will be a random sample within parameter space"
                 best_test_X_index = np.random.randint(0, test_X.shape[0] - 1)
                 break
             idx += 1
+
+    if reject_fn is not None and reject_fn(test_X[best_test_X_index]):
+        warnings = "\n reject_fn rejected the best sample. Picking a random sample instead."
+        best_test_X_index = np.random.randint(0, test_X.shape[0] - 1)
 
     suggested_X = test_X[best_test_X_index]
     suggested_X_prob_of_improvement = prob_of_improve[best_test_X_index]
@@ -491,7 +516,8 @@ def bayes_search_next_run(
     runs: List[SweepRun],
     config: Union[dict, SweepConfig],
     validate: bool = False,
-    minimum_improvement: floating = 0.1,
+    minimum_improvement: floating = 0.01,
+    reject_fn: Optional[Callable[[dict], bool]] = None,
 ) -> SweepRun:
     """Suggest runs using Bayesian optimization.
 
@@ -521,6 +547,9 @@ def bayes_search_next_run(
     params, sample_X, current_X, y, warnings_construct_gp_data = _construct_gp_data(
         runs, config
     )
+
+    _reject_fn = _reject_fn_wrapper(reject_fn, params) if reject_fn else None
+
     X_bounds = [[0.0, 1.0]] * len(params.searchable_params)
 
     (
@@ -536,17 +565,11 @@ def bayes_search_next_run(
         X_bounds=X_bounds,
         current_X=current_X if len(current_X) > 0 else None,
         improvement=minimum_improvement,
+        reject_fn=_reject_fn,
     )
 
-    # convert the parameters from vector of [0,1] values
-    # to the original ranges
-    for param in params:
-        if param.type == HyperParameter.CONSTANT:
-            continue
-        try_value = suggested_X[params.param_names_to_index[param.name]]
-        param.value = param.ppf(try_value)
+    ret_dict = _unnormalize_params(suggested_X, params).to_config()
 
-    ret_dict = params.to_config()
     info = {
         "success_probability": suggested_X_prob_of_improvement,
         "predicted_value": suggested_X_predicted_y,
@@ -563,11 +586,16 @@ def bayes_search_next_runs(
     validate: bool = False,
     n: int = 1,
     minimum_improvement: floating = 0.1,
+    reject_fn: Optional[Callable[[dict], bool]] = None,
 ):
     ret: List[SweepRun] = []
     for _ in range(n):
         suggestion = bayes_search_next_run(
-            runs + ret, config, validate, minimum_improvement
+            runs + ret,
+            config,
+            validate,
+            minimum_improvement,
+            reject_fn=reject_fn,
         )
         ret.append(suggestion)
     return ret
